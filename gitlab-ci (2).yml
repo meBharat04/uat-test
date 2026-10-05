@@ -1,0 +1,462 @@
+include:
+  - project: devops/job-templates
+    ref: v3.0.0
+    file: artifactory-jobs.yml
+  - project: devops/job-templates
+    ref: v3.0.0
+    file: java-jobs.yml
+  - project: devops/job-templates
+    ref: v3.0.0
+    file: change-jobs.yml
+  - project: devops/job-templates
+    ref: v3.0.0
+    file: test-jobs.yml
+  - project: devops/job-templates
+    ref: v3.0.0
+    file: security-jobs.yml
+  - project: devops/job-templates
+    ref: v3.0.0
+    file: deploy-jobs.yml
+  - project: devops/cicd-constructs
+    ref: v3.0.0
+    file: cicd-constructs.yml
+  - project: devops/cicd-constructs
+    ref: v3.0.0
+    file: mandatory-extends.yml
+  - project: devops/image-template
+    ref: main
+    file: images-jobs.yml
+
+stages:
+  - build
+  - verify-build
+  - pre-deploy
+  - deploy
+  - validate-deploy
+  - rollback
+  - plx-integeration
+  - publish-artifact
+  - retrieve-artifact
+  - predeploy-prod
+  - deploy-prod
+  - validate-deploy-prod
+  - rollback-prod
+  - plx-integeration-prod
+
+variables:
+  MANIFEST_FILE: k8s_configs/manifest.yml
+  AUTOSCALE_FILE: k8s_configs/autoscale.json
+  TARGET: target
+  MAVEN_OPTS: -Dmaven.repo.local=.m2/repository -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=WARN -Dorg.slf4j.simpleLogger.showDateTime=true -Djava.awt.headless=true
+  MAVEN_CLI_OPTS: --batch-mode --errors
+  DOMAIN_NP: r1.pcf.dell.com
+  GTM_DOMAIN: ${GTM_DOMAIN}
+  DOMAIN_PRI: ${DOMAIN_PRI}
+  DOMAIN_SEC: ${DOMAIN_SEC}
+  JAVA_JDK_IMAGE: $JAVA_21_JDK_IMG
+  PROPERTIES_FILE: src/main/resources/application.properties
+  KUBECTL_IMAGE: "harbor.dell.com/devops-images/debian-12/docker:latest"
+  APP_NAME: ansira-scim
+  OKTA_VAULT_NAMESPACE: 1011273
+
+.fetch-secret: &fetchSecret
+  - wget https://artifacts.dell.com/artifactory/hvault-1001095-generic-dev-local/hashicorp/vault/1.12.1/vault_1.12.1+ent_linux_amd64.zip -O ./vault-enterprise_1.8.3%2Bprem_linux_amd64.zip
+  - unzip ./vault-enterprise_1.8.3%2Bprem_linux_amd64.zip
+  - cp ./vault /usr/local/bin
+  - export VAULT_NAMESPACE=$VAULT_NAMESPACE
+  - echo "Vault jwt id token rolw is -- $VAULT_JWT_IDTOKEN_ROLE"
+  - echo "Vault jwt id token path is -- $VAULT_JWT_IDTOKEN_PATH"
+  - echo "Vault jwt id token is -- $VAULT_ID_TOKEN"
+  - echo "Vault addr is $VAULT_ADDR"
+  - echo "Vault cofig path is -- $VAULT_CONFIG_PATH"
+  - export VAULT_TOKEN=$(vault write -field=token auth/$VAULT_JWT_IDTOKEN_PATH/login role=$VAULT_JWT_IDTOKEN_ROLE jwt=$VAULT_ID_TOKEN)
+  - export kob_auth_endpoint="$(vault kv get -field=AUTH_ENDPOINT $VAULT_CONFIG_PATH)"
+  - export kob_cluster="$(vault kv get -field=CLUSTER $VAULT_CONFIG_PATH)"
+  - export kob_namespace="$(vault kv get -field=NAMESPACE $VAULT_CONFIG_PATH)"
+  - export kob_password="$(vault kv get -field=PASSWORD $VAULT_CONFIG_PATH)"
+  - export kob_username="$(vault kv get -field=USERNAME $VAULT_CONFIG_PATH)"
+  - echo $kob_auth_endpoint
+  - echo $kob_cluster
+  - echo $kob_namespace
+  - echo $kob_username
+
+.kobLogin: &kobLogin
+  - echo "$kob_password" | kob get-kubeconfig $kob_cluster -u $kob_username -a $kob_auth_endpoint -k
+  - kubectl config set-context --current --namespace=$kob_namespace
+  - kubectl config get-contexts
+  - kob -v
+
+.updatemanifest: &updatemanifest
+  - |
+    echo "updating manifest file $MANIFEST_FILE"
+    sed -i "s/((env))/$ENV/g" $MANIFEST_FILE
+    sed -i "s|((config-domain))|$CONFIG_DOMAIN|g" $MANIFEST_FILE
+    sed -i "s|((cluster-domain))|$CLUSTER_DOMAIN|g" $MANIFEST_FILE
+    sed -i "s|((app-name))|$APP_NAME|g" $MANIFEST_FILE
+    sed -i "s|((global-domain))|$GLOBAL_DOMAIN|g" $MANIFEST_FILE
+    sed -i "s|((instance-count))|$INSTANCE_COUNT|g" $MANIFEST_FILE
+    echo "updated manifest file"
+  - |
+    war_file_name=$(find target/*.war | head -n 1) && echo "$war_file_name" || true
+    jar_file_name=$(find target/*.jar | head -n 1) && echo "$jar_file_name" || true
+    if [[ -n $war_file_name ]]; then export jar_war_file=$war_file_name; fi
+    if [[ -n $jar_file_name ]]; then export jar_war_file=$jar_file_name; fi
+    escaped_jar_war_file=$(echo "$jar_war_file" | sed 's#/#\\/#g') && echo "$escaped_jar_war_file"
+    sed -i "s|((jar-war-file))|$escaped_jar_war_file|g" $MANIFEST_FILE
+    echo "jar-war-file updated"
+    cat $MANIFEST_FILE
+
+.updateApplicationProperties: &updateApplicationProperties
+  - echo "updating application.properties file"
+  - sed -i "s|((cluster-domain))|$CLUSTER_DOMAIN|g" $PROPERTIES_FILE
+  - echo "updated application.properties file"
+  - cat src/main/resources/application.properties
+
+.id_tokens_prod: &id_tokens_prod
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: $VAULT_ADDR
+
+.id_tokens_nonprod: &id_tokens_nonprod
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: $NONPROD_VAULT_ADDR
+
+.rules_common: &rules_common
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^([fF]eature|[rR]elease).*$/
+    - if: $CI_COMMIT_BRANCH =~ /^([Mm]aster|[Mm]ain).*$/
+    - if: $CI_COMMIT_BRANCH =~ /^([uU]at|[Mm]ain).*$/  ## support temporary UAT branch push
+    - if: $CI_COMMIT_BRANCH =~ /^([pP]review).*$/  ## support temporary preview branch
+
+###################################################################################################
+#                                        BUILD JOBS
+###################################################################################################
+
+compile-build:
+  extends: .compile-package-maven
+  image: $JAVA_JDK_IMAGE
+  <<: *rules_common
+  stage: build
+  before_script:
+    - cp -rf setting.xml /opt/maven/conf/settings.xml
+  allow_failure: false
+
+unit-test:
+  extends: .unit-test-maven
+  image: $JAVA_JDK_IMAGE
+  <<: *rules_common
+  stage: verify-build
+  allow_failure: false
+
+code-quality1:
+  stage: verify-build
+  extends: .code-quality
+  image: $JAVA_JDK_IMAGE
+  <<: *id_tokens_nonprod
+  before_script:
+    - export VAULT_ADDR=$NONPROD_VAULT_ADDR
+    - java -version
+    - javac -version
+  allow_failure: true
+  <<: *rules_common
+  variables:
+    SONAR_HOST: https://sonarqube.dell.com
+    SONAR_EXCLUSIONS: '**/*.xml, **/*.xlsm, **/*.xsd, **/*.css, **/*.less, **/*.scss, **/*.java'
+    SONAR_BRANCH: $CI_COMMIT_REF_NAME
+    SONAR_PROJECT_NAME: $CI_PROJECT_NAME
+    JAR_FILE: target/*.war
+    SONAR_LANG: maven
+
+xray-scan1:
+  extends: .xray-scan
+  <<: *id_tokens_nonprod
+  variables:
+    ARTIFACT_LANG: default
+    ARTIFACT_SECRET_PATH: kv/ARTIFACTORY
+    TARGET: target/maven-archiver/
+  before_script:
+    - export VAULT_ADDR=$NONPROD_VAULT_ADDR
+  allow_failure: false
+  <<: *rules_common
+  stage: verify-build
+
+sast-scan:
+  <<: *id_tokens_nonprod
+  extends: .sast-scan
+  allow_failure: true
+  when: always
+
+sca-scan:
+  <<: *id_tokens_nonprod
+  extends: .sca-scan
+  allow_failure: true
+  when: always
+
+###################################################################################################
+#                                        DEPLOY JOBS
+###################################################################################################
+
+.vaultanchor: &vaultanchor
+  - export VAULT_ADDR=$NONPROD_VAULT_ADDR
+  - export VAULT_NAMESPACE=$OKTA_VAULT_NAMESPACE
+  - echo "vault namespace is -- $VAULT_NAMESPACE"
+
+.vaultanchorprod: &vaultanchorprod
+  - export PROD_VAULT_ADDR=$VAULT_ADDR
+  - export VAULT_NAMESPACE=$OKTA_VAULT_NAMESPACE
+  - echo "vault namespace is -- $VAULT_NAMESPACE"
+
+.predeployAnchor: &predeployAnchor
+  - kubectl get deployment/$APP_NAME
+  - echo $(kubectl get deployment/$APP_NAME -o jsonpath='{.spec.template.spec.containers[*].image}') >> rollback-image-$ENV.txt
+  - cat rollback-image-$ENV.txt
+
+.validateanchor: &validateanchor
+  - curl -v https://$APP_NAME.$CLUSTER_DOMAIN/actuator/health/liveness
+
+.rollbackAnchor: &rollbackAnchor
+  - export KOBACE_ARGS="$APP_NAME -f $MANIFEST_FILE"
+  - cp -r rollback-image-$ENV.txt kob-build-container.txt
+  - cp -r rollback-image-$ENV.txt kob-build-container-$ENV.txt
+  - cat kob-build-container.txt
+  - cat kob-build-container-$ENV.txt
+
+.commonvariables: &commonvariables
+  IS_BLUE_GREEN_DEPLOY: "false"
+  TARGET_K8S_OBJECTS: $MANIFEST_FILE
+  KOBACE_MANIFEST_FILE: $MANIFEST_FILE
+  CONTAINER_TOOL: kob
+
+###################################################################################################
+#                               DEV ENVIRONMENT JOBS
+###################################################################################################
+
+.dev_rules: &dev_rules
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^([fF]eature|[Mm]ain).*$/
+
+# TODO: confirm GLOBAL_DOMAIN, CLUSTER_DOMAIN, VAULT_CONFIG_PATH with Jebastin for IGA namespace
+.kobvariablesdev: &kobvariablesdev
+  ENV: dev
+  INSTANCE_COUNT: 1
+  GLOBAL_DOMAIN: "iga-dev.kob.dell.com"
+  VAULT_CONFIG_PATH: kv/KOB/dev-core
+  CLUSTER_DOMAIN: "iga-dev-a4-np.kob.dell.com"
+  CONFIG_DOMAIN: $CLUSTER_DOMAIN
+  <<: *commonvariables
+
+pre-deploy-dev:
+  stage: pre-deploy
+  image: $KUBECTL_IMAGE
+  <<: *id_tokens_nonprod
+  <<: *dev_rules
+  variables:
+    <<: *kobvariablesdev
+  before_script:
+    - *vaultanchor
+    - *fetchSecret
+  script:
+    - *kobLogin
+    - *predeployAnchor
+  artifacts:
+    paths:
+      - rollback-image-$ENV.txt
+  allow_failure: true
+  tags:
+    - linux
+
+k8s-kobace-deploy-dev:
+  extends: .deploy-k8s-kobace
+  needs: ["compile-build", "unit-test", "pre-deploy-dev"]
+  <<: *dev_rules
+  <<: *id_tokens_nonprod
+  variables:
+    debug: true
+    <<: *kobvariablesdev
+  before_script:
+    - *vaultanchor
+    - *updatemanifest
+    - export KOBACE_ARGS="$APP_NAME -f $MANIFEST_FILE"
+
+validate-dev:
+  variables:
+    <<: *kobvariablesdev
+  before_script:
+    - *updatemanifest
+  script:
+    - *validateanchor
+  <<: *dev_rules
+  stage: validate-deploy
+  tags:
+    - linux
+
+rollback-kobace-dev:
+  when: manual
+  stage: rollback
+  needs: ["pre-deploy-dev", "k8s-kobace-deploy-dev"]
+  extends: .deploy-k8s-kobace
+  <<: *id_tokens_nonprod
+  <<: *dev_rules
+  variables:
+    <<: *kobvariablesdev
+  before_script:
+    - *vaultanchor
+    - *updatemanifest
+    - *rollbackAnchor
+    
+
+
+#############################################Test jobs##################################################################
+
+
+.test_rules: &test_rules
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^([uU]at|[Mm]ain).*$/  ## temp UAT naming convention allowing direct push
+
+# TODO: confirm GLOBAL_DOMAIN, CLUSTER_DOMAIN, VAULT_CONFIG_PATH with Jebastin for IGA namespace
+.kobvariablestestws01: &kobvariablestestws01
+  ENV: test
+  INSTANCE_COUNT: 1
+  GLOBAL_DOMAIN: "iga-qa.kob.dell.com"  ## this need to be changed
+  VAULT_CONFIG_PATH: kv/KOB/qa-ws01
+  CLUSTER_DOMAIN: "iga-qa-a5-np.kob.dell.com" ## this need to be changed
+  CONFIG_DOMAIN: $CLUSTER_DOMAIN
+  <<: *commonvariables
+
+pre-deploy-qa-ws01:
+  stage: pre-deploy
+  image: $KUBECTL_IMAGE
+  <<: *id_tokens_nonprod
+  <<: *test_rules
+  variables:
+    <<: *kobvariablestestws01
+  before_script:
+    - *vaultanchor
+    - *fetchSecret
+  script:
+    - *kobLogin
+    - *predeployAnchor
+  artifacts:
+    paths:
+      - rollback-image-$ENV.txt
+  allow_failure: true
+  tags:
+    - linux
+
+k8s-kobace-deploy-qa-ws01:
+  extends: .deploy-k8s-kobace
+  needs: ["compile-build", "unit-test", "pre-deploy-qa-ws01"]
+  <<: *test_rules
+  <<: *id_tokens_nonprod
+  variables:
+    debug: true
+    <<: *kobvariablestestws01
+  before_script:
+    - *vaultanchor
+    - *updatemanifest
+    - export KOBACE_ARGS="$APP_NAME -f $MANIFEST_FILE"
+
+validate-qa-ws01:
+  variables:
+    <<: *kobvariablestestws01
+  before_script:
+    - *updatemanifest
+  script:
+    - *validateanchor
+  <<: *test_rules
+  stage: validate-deploy
+  tags:
+    - linux
+
+rollback-kobace-qa-ws01:
+  when: manual
+  stage: rollback
+  needs: ["pre-deploy-qa-ws01", "k8s-kobace-deploy-qa-ws01"]
+  extends: .deploy-k8s-kobace
+  <<: *id_tokens_nonprod
+  <<: *test_rules
+  variables:
+    <<: *kobvariablestestws01
+  before_script:
+    - *vaultanchor
+    - *updatemanifest
+    - *rollbackAnchor
+
+
+
+#############################################PROD jobs##################################################################
+
+
+.prod_rules: &prod_rules
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^([pP]rod).*$/  ## temp PROD naming convention allowing direct push
+
+# TODO: confirm GLOBAL_DOMAIN, CLUSTER_DOMAIN, VAULT_CONFIG_PATH with Jebastin for IGA namespace
+.kobvariablesprod: &kobvariablesprod
+  ENV: prod
+  INSTANCE_COUNT: 1
+  GLOBAL_DOMAIN: "iga-prd.kob.dell.com"  
+  VAULT_CONFIG_PATH: kv/KOB/iga-pc1web01   ## for p7, use kv/KOB/iga-pc1web01 ; for s8, use /iga-s3bwebxx
+  CLUSTER_DOMAIN: "iga-prd-p7.kob.dell.com" 
+  CONFIG_DOMAIN: $CLUSTER_DOMAIN
+  <<: *commonvariables
+
+pre-deploy-prod:
+  stage: pre-deploy
+  image: $KUBECTL_IMAGE
+  <<: *id_tokens_prod
+  <<: *prod_rules
+  variables:
+    <<: *kobvariablesprod
+  before_script:
+    - *vaultanchor
+    - *fetchSecret
+  script:
+    - *kobLogin
+    - *predeployAnchor
+  artifacts:
+    paths:
+      - rollback-image-$ENV.txt
+  allow_failure: true
+  tags:
+    - linux
+
+k8s-kobace-deploy-prod:
+  extends: .deploy-k8s-kobace
+  needs: ["compile-build", "unit-test", "pre-deploy-prod"]
+  <<: *prod_rules
+  <<: *id_tokens_prod
+  variables:
+    debug: true
+    <<: *kobvariablesprod
+  before_script:
+    - *vaultanchor
+    - *updatemanifest
+    - export KOBACE_ARGS="$APP_NAME -f $MANIFEST_FILE"
+
+validate-prod:
+  variables:
+    <<: *kobvariablesprod
+  before_script:
+    - *updatemanifest
+  script:
+    - *validateanchor
+  <<: *prod_rules
+  stage: validate-deploy
+  tags:
+    - linux
+
+rollback-kobace-prod:
+  when: manual
+  stage: rollback
+  needs: ["pre-deploy-prod", "k8s-kobace-deploy-prod"]
+  extends: .deploy-k8s-kobace
+  <<: *id_tokens_prod
+  <<: *prod_rules
+  variables:
+    <<: *kobvariablesprod
+  before_script:
+    - *vaultanchor
+    - *updatemanifest
+    - *rollbackAnchor
